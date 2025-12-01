@@ -8,57 +8,209 @@
 |------|------|
 | 포트 | 8087 |
 | 데이터베이스 | user_db (PostgreSQL) |
-| 주요 역할 | 사용자 생명주기 관리 |
+| 주요 역할 | 사용자 프로필 관리 (인증 정보는 Auth Server에서 관리) |
+
+## 🏗️ 아키텍처 결정사항
+
+### Auth Server와의 역할 분리
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        회원가입 흐름                              │
+├─────────────────────────────────────────────────────────────────┤
+│  Client                                                          │
+│    │                                                             │
+│    ▼                                                             │
+│  User Service ──────Feign (동기)─────▶ Auth Server              │
+│    │                                        │                    │
+│    │ User 저장                              │ AuthUser 저장       │
+│    │ (프로필 정보)                          │ (인증 정보)         │
+│    ▼                                        ▼                    │
+│  user_db                                 auth_db                 │
+│  - name                                  - email                 │
+│  - phoneNumber                           - password (암호화)     │
+│  - birthDate                             - role                  │
+│  - status                                - status                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**분리 이유:**
+1. **인증 독립성**: Auth Server 장애 시에도 로그인 가능
+2. **빠른 응답**: 인증 시 User Service 조회 불필요
+3. **확장성**: 인증 방식 변경이 User Service에 영향 없음
+
+---
 
 ## 🎯 학습 포인트
 
-### 1. 기본 CRUD 패턴
-- **JPA Entity 설계**: `@Entity`, `@Table`, `@Column` 활용
-- **Repository 패턴**: Spring Data JPA 기본 사용법
-- **DTO 변환**: Entity ↔ DTO 분리 (보안, 유연성)
-- **Validation**: `@Valid`, `@NotBlank`, `@Email` 등 Bean Validation
-
-### 2. 이벤트 발행 (Kafka Producer)
+### 1. 헥사고날 아키텍처 + 도메인 중심 설계
 ```
-회원가입 완료 → user.created 이벤트 발행 → Auth Server 수신
+domain/
+├── domain/        # 순수 도메인 (Infrastructure 의존성 없음)
+│   ├── exception/ # 도메인 예외 (ErrorCode, Exception)
+│   └── model/     # 도메인 모델, Enum, VO
+├── application/   # 유스케이스, Port (인터페이스)
+├── infrastructure/# Adapter (Out) - Repository, Feign, Kafka
+└── presentation/  # Adapter (In) - Controller
+```
+
+### 2. 이벤트 기반 통신 (Kafka)
+```
+회원가입 완료 → user.created 이벤트 발행
 회원 탈퇴 → user.deleted 이벤트 발행 → 모든 서비스 수신 (연관 데이터 정리)
 ```
 
-### 3. 보안 고려사항
-- 비밀번호 암호화 (BCrypt)
-- 민감 정보 마스킹 (주민번호, 전화번호)
-- API 응답에서 비밀번호 제외
+### 3. 동기 호출 (Feign)
+```
+회원가입 → User Service → Feign → Auth Server (인증 정보 생성)
+```
 
 ---
 
 ## 🗄️ 도메인 모델
 
-### User Entity
-
+### 도메인 구조
 ```
-┌─────────────────────────────────────────────┐
-│                    User                      │
-├─────────────────────────────────────────────┤
-│ id: Long (PK, Auto)                         │
-│ email: String (Unique, Not Null)            │
-│ password: String (Encrypted)                │
-│ name: String                                │
-│ phoneNumber: String                         │
-│ birthDate: LocalDate                        │
-│ status: UserStatus (ACTIVE/INACTIVE/DELETED)│
-│ createdAt: LocalDateTime                    │
-│ updatedAt: LocalDateTime                    │
-│ version: Long (@Version - 낙관적 락)         │
-└─────────────────────────────────────────────┘
+domain/user/domain/
+├── exception/
+│   ├── UserErrorCode.java      # 에러 코드 정의
+│   └── UserException.java      # 도메인 예외
+└── model/
+    ├── User.java               # 사용자 Aggregate Root
+    ├── UserStatus.java         # 상태 Enum (정책 메서드 포함)
+    └── vo/
+        ├── UserId.java         # 사용자 ID (USR-xxxxxxxx)
+        ├── Email.java          # 이메일 (검증, 마스킹)
+        └── PhoneNumber.java    # 전화번호 (검증, 정규화)
 ```
 
-### UserStatus Enum
+### User 도메인 모델
+```
+┌─────────────────────────────────────────────────────────────┐
+│                          User                                │
+├─────────────────────────────────────────────────────────────┤
+│ 【핵심 필드】                                                 │
+│ userId: UserId (PK, USR-xxxxxxxx)                           │
+│ email: Email (Unique, 불변)                                  │
+│ name: String (2~50자)                                       │
+│ phoneNumber: PhoneNumber (010-xxxx-xxxx)                    │
+│ birthDate: LocalDate (불변)                                  │
+│ status: UserStatus (ACTIVE/INACTIVE/SUSPENDED/DELETED)      │
+├─────────────────────────────────────────────────────────────┤
+│ 【감사 필드 - BaseEntity】                                    │
+│ createdAt: LocalDateTime (자동)                              │
+│ updatedAt: LocalDateTime (자동)                              │
+│ createdBy: String (자동)                                     │
+│ updatedBy: String (자동)                                     │
+│ deletedAt: LocalDateTime (Soft Delete)                      │
+│ deletedBy: String (Soft Delete)                             │
+│ isDeleted: Boolean (Soft Delete)                            │
+├─────────────────────────────────────────────────────────────┤
+│ 【비즈니스 메서드】                                           │
+│ + updateProfile(name, phoneNumber): void                    │
+│ + withdraw(): void        // 탈퇴 (→ DELETED)               │
+│ + suspend(): void         // 정지 (→ SUSPENDED)             │
+│ + activate(): void        // 활성화 (→ ACTIVE)              │
+│ + deactivate(): void      // 휴면 (→ INACTIVE)              │
+├─────────────────────────────────────────────────────────────┤
+│ 【상태 확인 메서드】                                          │
+│ + isNew(): boolean        // userId == null                 │
+│ + isActive(): boolean                                       │
+│ + isDeleted(): boolean                                      │
+│ + isSuspended(): boolean                                    │
+│ + isInactive(): boolean                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### UserStatus Enum (정책 메서드 포함)
 ```java
 public enum UserStatus {
-    ACTIVE,     // 정상
-    INACTIVE,   // 휴면
-    SUSPENDED,  // 정지
-    DELETED     // 탈퇴 (Soft Delete)
+    ACTIVE("정상", canLogin=true, canModifyProfile=true),
+    INACTIVE("휴면", canLogin=false, canModifyProfile=true),
+    SUSPENDED("정지", canLogin=false, canModifyProfile=false),
+    DELETED("탈퇴", canLogin=false, canModifyProfile=false);
+    
+    // 상태 전이 규칙
+    public boolean canTransitionTo(UserStatus target);
+    public Set<UserStatus> getAllowedTransitions();
+}
+```
+
+**상태 전이 규칙:**
+```
+ACTIVE → INACTIVE, SUSPENDED, DELETED
+INACTIVE → ACTIVE, DELETED
+SUSPENDED → ACTIVE, DELETED
+DELETED → (전이 불가, 최종 상태)
+```
+
+### Value Objects
+
+#### UserId
+```java
+public record UserId(String value) {
+    public static final String PREFIX = "USR";
+    
+    public static String generateId();  // Entity 저장 시 호출
+    // 형식: USR-xxxxxxxx (예: USR-a1b2c3d4)
+}
+```
+
+#### Email
+```java
+public record Email(String value) {
+    // 검증: RFC 5322 기반, 최대 255자
+    // 정규화: 소문자 변환
+    
+    public String getDomain();    // @example.com → example.com
+    public String getLocalPart(); // user@example.com → user
+    public String masked();       // user@example.com → u***r@example.com
+}
+```
+
+#### PhoneNumber
+```java
+public record PhoneNumber(String value) {
+    // 검증: 한국 휴대폰 번호 (01X-XXXX-XXXX)
+    // 정규화: 010-1234-5678 형식으로 변환
+    
+    public String masked();        // 010-****-5678
+    public String withoutHyphen(); // 01012345678
+}
+```
+
+### Exception 체계
+
+#### UserErrorCode
+```java
+public enum UserErrorCode implements ErrorCode {
+    // 유효성 검증 (400)
+    INVALID_EMAIL_FORMAT("USER_001", "유효하지 않은 이메일 형식입니다", 400),
+    INVALID_PHONE_FORMAT("USER_002", "유효하지 않은 전화번호 형식입니다", 400),
+    INVALID_NAME("USER_003", "이름은 2~50자 사이여야 합니다", 400),
+    INVALID_USER_ID_FORMAT("USER_005", "유효하지 않은 사용자 ID 형식입니다", 400),
+    
+    // 조회 (404)
+    USER_NOT_FOUND("USER_010", "사용자를 찾을 수 없습니다", 404),
+    
+    // 중복 (409)
+    EMAIL_ALREADY_EXISTS("USER_020", "이미 사용 중인 이메일입니다", 409),
+    
+    // 상태 (422)
+    CANNOT_MODIFY_DELETED_USER("USER_034", "탈퇴한 사용자는 수정할 수 없습니다", 422),
+    CANNOT_MODIFY_SUSPENDED_USER("USER_035", "정지된 사용자는 수정할 수 없습니다", 422),
+    INVALID_STATUS_TRANSITION("USER_036", "허용되지 않은 상태 변경입니다", 422);
+}
+```
+
+#### UserException (팩토리 메서드 패턴)
+```java
+public class UserException extends BusinessException {
+    // 팩토리 메서드
+    public static UserException userNotFound(String userId);
+    public static UserException emailAlreadyExists(String email);
+    public static UserException cannotModifyDeletedUser();
+    public static UserException invalidStatusTransition(String from, String to);
+    // ...
 }
 ```
 
@@ -80,10 +232,15 @@ Content-Type: application/json
 }
 ```
 
+**처리 흐름:**
+1. User Service: 프로필 정보 저장 (User)
+2. Feign → Auth Server: 인증 정보 저장 (AuthUser)
+3. Kafka: `user.created` 이벤트 발행
+
 **Response (201 Created)**
 ```json
 {
-  "id": 1,
+  "userId": "USR-a1b2c3d4",
   "email": "user@example.com",
   "name": "홍길동",
   "phoneNumber": "010-****-5678",
@@ -92,33 +249,17 @@ Content-Type: application/json
 }
 ```
 
-**이벤트 발행**: `user.created`
-```json
-{
-  "eventId": "uuid",
-  "eventType": "USER_CREATED",
-  "timestamp": "2024-01-15T10:30:00",
-  "payload": {
-    "userId": 1,
-    "email": "user@example.com",
-    "name": "홍길동"
-  }
-}
-```
-
----
-
-### 2. 사용자 조회 (단건)
+### 2. 사용자 조회
 ```http
 GET /api/v1/users/{userId}
-X-User-Id: 1
+X-User-Id: USR-a1b2c3d4
 X-User-Role: USER
 ```
 
 **Response (200 OK)**
 ```json
 {
-  "id": 1,
+  "userId": "USR-a1b2c3d4",
   "email": "user@example.com",
   "name": "홍길동",
   "phoneNumber": "010-****-5678",
@@ -128,12 +269,10 @@ X-User-Role: USER
 }
 ```
 
----
-
-### 3. 사용자 정보 수정
+### 3. 프로필 수정
 ```http
 PUT /api/v1/users/{userId}
-X-User-Id: 1
+X-User-Id: USR-a1b2c3d4
 X-User-Role: USER
 Content-Type: application/json
 
@@ -143,106 +282,24 @@ Content-Type: application/json
 }
 ```
 
-**Response (200 OK)**
-```json
-{
-  "id": 1,
-  "email": "user@example.com",
-  "name": "홍길동(수정)",
-  "phoneNumber": "010-****-5432",
-  "status": "ACTIVE",
-  "updatedAt": "2024-01-15T11:00:00"
-}
-```
+**도메인 검증:**
+- DELETED, SUSPENDED 상태에서는 수정 불가 (UserException 발생)
+- 이름 2~50자 검증
+- 전화번호 형식 검증
 
-**이벤트 발행**: `user.updated`
-
----
-
-### 4. 비밀번호 변경
-```http
-PUT /api/v1/users/{userId}/password
-X-User-Id: 1
-X-User-Role: USER
-Content-Type: application/json
-
-{
-  "currentPassword": "OldPassword123!",
-  "newPassword": "NewPassword456!"
-}
-```
-
-**Response (200 OK)**
-```json
-{
-  "message": "비밀번호가 변경되었습니다."
-}
-```
-
----
-
-### 5. 회원 탈퇴 (Soft Delete)
+### 4. 회원 탈퇴 (Soft Delete)
 ```http
 DELETE /api/v1/users/{userId}
-X-User-Id: 1
+X-User-Id: USR-a1b2c3d4
 X-User-Role: USER
 ```
 
-**Response (200 OK)**
-```json
-{
-  "message": "회원 탈퇴가 완료되었습니다."
-}
-```
+**처리:**
+1. `user.withdraw()` 호출 → status = DELETED
+2. BaseEntity: `isDeleted = true`, `deletedAt`, `deletedBy` 설정
+3. Kafka: `user.deleted` 이벤트 발행
 
-**이벤트 발행**: `user.deleted`
-```json
-{
-  "eventId": "uuid",
-  "eventType": "USER_DELETED",
-  "timestamp": "2024-01-15T12:00:00",
-  "payload": {
-    "userId": 1
-  }
-}
-```
-
----
-
-### 6. 사용자 목록 조회 (관리자)
-```http
-GET /api/v1/users?page=0&size=20&status=ACTIVE
-X-User-Id: 999
-X-User-Role: ADMIN
-```
-
-**Response (200 OK)**
-```json
-{
-  "content": [
-    {
-      "id": 1,
-      "email": "user1@example.com",
-      "name": "홍길동",
-      "status": "ACTIVE"
-    },
-    {
-      "id": 2,
-      "email": "user2@example.com",
-      "name": "김철수",
-      "status": "ACTIVE"
-    }
-  ],
-  "page": 0,
-  "size": 20,
-  "totalElements": 100,
-  "totalPages": 5
-}
-```
-
----
-
-### 7. 이메일 중복 확인
+### 5. 이메일 중복 확인
 ```http
 GET /api/v1/users/check-email?email=user@example.com
 ```
@@ -262,159 +319,115 @@ GET /api/v1/users/check-email?email=user@example.com
 ```
 com.jun_bank.user_service
 ├── UserServiceApplication.java
-├── global/                          # 전역 설정 레이어
-│   ├── config/                      # 설정 클래스
-│   │   ├── JpaConfig.java           # JPA Auditing 활성화
-│   │   ├── QueryDslConfig.java      # QueryDSL JPAQueryFactory 빈
-│   │   ├── KafkaProducerConfig.java # Kafka Producer (멱등성, JacksonJsonSerializer)
-│   │   ├── KafkaConsumerConfig.java # Kafka Consumer (수동 ACK, JacksonJsonDeserializer)
-│   │   ├── SecurityConfig.java      # Spring Security (헤더 기반 인증)
-│   │   ├── FeignConfig.java         # Feign Client 설정
-│   │   ├── SwaggerConfig.java       # OpenAPI 문서화
-│   │   └── AsyncConfig.java         # 비동기 처리 (ThreadPoolTaskExecutor)
+├── global/                              # 전역 설정 레이어
+│   ├── config/
+│   │   ├── JpaConfig.java               # JPA Auditing 활성화
+│   │   ├── QueryDslConfig.java          # QueryDSL JPAQueryFactory
+│   │   ├── KafkaProducerConfig.java     # 멱등성 Producer
+│   │   ├── KafkaConsumerConfig.java     # 수동 ACK Consumer
+│   │   ├── SecurityConfig.java          # 헤더 기반 인증
+│   │   ├── FeignConfig.java             # Feign Client 설정
+│   │   ├── SwaggerConfig.java           # OpenAPI 문서화
+│   │   └── AsyncConfig.java             # 비동기 처리
 │   ├── infrastructure/
 │   │   ├── entity/
-│   │   │   └── BaseEntity.java      # 공통 엔티티 (Audit, Soft Delete)
+│   │   │   └── BaseEntity.java          # 공통 엔티티 (Audit, Soft Delete)
 │   │   └── jpa/
-│   │       └── AuditorAwareImpl.java # JPA Auditing 사용자 정보
+│   │       └── AuditorAwareImpl.java    # JPA Auditing 사용자 정보
 │   ├── security/
-│   │   ├── UserPrincipal.java       # 인증 사용자 Principal
-│   │   ├── HeaderAuthenticationFilter.java # Gateway 헤더 인증 필터
-│   │   └── SecurityContextUtil.java # SecurityContext 유틸리티
+│   │   ├── UserPrincipal.java           # 인증 사용자 Principal
+│   │   ├── HeaderAuthenticationFilter.java
+│   │   └── SecurityContextUtil.java
 │   ├── feign/
-│   │   ├── FeignErrorDecoder.java   # Feign 에러 → BusinessException 변환
+│   │   ├── FeignErrorDecoder.java       # Feign 에러 → BusinessException
 │   │   └── FeignRequestInterceptor.java # 인증 헤더 전파
 │   └── aop/
-│       └── LoggingAspect.java       # 요청/응답 로깅 AOP
+│       └── LoggingAspect.java           # 요청/응답 로깅
 └── domain/
-    └── user/                        # User 도메인
-        ├── domain/                  # 순수 도메인 (Entity, VO, Enum)
-        ├── application/             # 유스케이스, Port, DTO
-        ├── infrastructure/          # Adapter (Out) - Repository, Kafka
-        └── presentation/            # Adapter (In) - Controller
-```
-
----
-
-## 🔧 Global 레이어 상세
-
-### Config 설정
-
-| 클래스 | 설명 |
-|--------|------|
-| `JpaConfig` | JPA Auditing 활성화 (`@EnableJpaAuditing`) |
-| `QueryDslConfig` | `JPAQueryFactory` 빈 등록 |
-| `KafkaProducerConfig` | 멱등성 Producer (ENABLE_IDEMPOTENCE=true, ACKS=all) |
-| `KafkaConsumerConfig` | 수동 ACK (MANUAL_IMMEDIATE), group-id: user-service-group |
-| `SecurityConfig` | Stateless 세션, 헤더 기반 인증, CSRF 비활성화 |
-| `FeignConfig` | 로깅 레벨 BASIC, 에러 디코더, 요청 인터셉터 |
-| `SwaggerConfig` | OpenAPI 3.0 문서화 설정 |
-| `AsyncConfig` | ThreadPoolTaskExecutor (core=5, max=10, queue=25) |
-
-### Security 설정
-
-| 클래스 | 설명 |
-|--------|------|
-| `HeaderAuthenticationFilter` | `X-User-Id`, `X-User-Role`, `X-User-Email` 헤더 → SecurityContext |
-| `UserPrincipal` | `UserDetails` 구현체, 인증된 사용자 정보 |
-| `SecurityContextUtil` | 현재 사용자 조회 유틸리티 |
-
-### BaseEntity (Soft Delete 지원)
-
-```java
-@MappedSuperclass
-public abstract class BaseEntity {
-    private LocalDateTime createdAt;      // 생성일시 (자동)
-    private LocalDateTime updatedAt;      // 수정일시 (자동)
-    private String createdBy;             // 생성자 (자동)
-    private String updatedBy;             // 수정자 (자동)
-    private LocalDateTime deletedAt;      // 삭제일시
-    private String deletedBy;             // 삭제자
-    private Boolean isDeleted = false;    // 삭제 여부
-    
-    public void delete(String deletedBy);  // Soft Delete
-    public void restore();                 // 복구
-}
+    └── user/                            # User Bounded Context
+        ├── domain/                      # 순수 도메인 ★ 구현 완료
+        │   ├── exception/
+        │   │   ├── UserErrorCode.java   # 에러 코드 (common-lib ErrorCode 구현)
+        │   │   └── UserException.java   # 도메인 예외 (BusinessException 상속)
+        │   └── model/
+        │       ├── User.java            # Aggregate Root
+        │       ├── UserStatus.java      # 상태 Enum (정책 메서드)
+        │       └── vo/
+        │           ├── UserId.java      # 사용자 ID VO
+        │           ├── Email.java       # 이메일 VO
+        │           └── PhoneNumber.java # 전화번호 VO
+        ├── application/                 # 유스케이스 (TODO)
+        │   ├── port/
+        │   │   ├── in/                  # UseCase 인터페이스
+        │   │   └── out/                 # Repository, Feign Port
+        │   ├── service/
+        │   └── dto/
+        ├── infrastructure/              # Adapter Out (TODO)
+        │   ├── persistence/
+        │   │   ├── entity/              # JPA Entity
+        │   │   ├── repository/          # JPA Repository
+        │   │   └── adapter/             # Repository Adapter
+        │   ├── feign/                   # Auth Server Feign Client
+        │   └── kafka/                   # Kafka Producer
+        └── presentation/                # Adapter In (TODO)
+            ├── controller/
+            └── dto/
 ```
 
 ---
 
 ## 🔗 서비스 간 통신
 
-### 발행 이벤트 (Kafka Producer)
-| 이벤트 | 토픽 | 수신 서비스 | 설명 |
-|--------|------|-------------|------|
-| USER_CREATED | user.created | Auth Server | 계정 생성 트리거 |
-| USER_UPDATED | user.updated | - | 정보 변경 알림 |
-| USER_DELETED | user.deleted | All Services | 연관 데이터 정리 |
+### Feign Client (동기 호출)
+| 대상 | 용도 | 실패 시 |
+|------|------|---------|
+| Auth Server | 회원가입 시 인증 정보 생성 | 트랜잭션 롤백 |
 
-### 수신 이벤트 (Kafka Consumer)
-| 이벤트 | 토픽 | 발신 서비스 | 설명 |
-|--------|------|-------------|------|
-| - | - | - | (현재 없음) |
-
-### Feign Client 호출
-| 대상 서비스 | 용도 | 비고 |
-|-------------|------|------|
-| Auth Server | 계정 상태 동기화 | 선택적 |
-
----
-
-## ⚙️ 설정
-
-### application.yml (서비스 내부)
-- 포트: 8087
-- Eureka 등록
-- Config Server 연결
-
-### config-repo (Config Server)
-- DB 접속 정보: user_db
-- Kafka 토픽 정의
-- 서비스 고유 설정 (비밀번호 정책 등)
-
----
-
-## 🧪 테스트 시나리오
-
-### 1. 회원가입 테스트
-```bash
-# 정상 케이스
-curl -X POST http://localhost:8080/api/v1/users \
-  -H "Content-Type: application/json" \
-  -d '{"email":"test@test.com","password":"Test1234!","name":"테스트"}'
-
-# 중복 이메일 (409 Conflict 예상)
-curl -X POST http://localhost:8080/api/v1/users \
-  -H "Content-Type: application/json" \
-  -d '{"email":"test@test.com","password":"Test1234!","name":"테스트2"}'
-
-# 유효성 검증 실패 (400 Bad Request 예상)
-curl -X POST http://localhost:8080/api/v1/users \
-  -H "Content-Type: application/json" \
-  -d '{"email":"invalid-email","password":"123","name":""}'
-```
-
-### 2. Kafka 이벤트 확인
-```bash
-# Kafka 토픽 메시지 확인
-docker exec -it kafka-1 kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 \
-  --topic user.created \
-  --from-beginning
-```
+### Kafka (비동기 이벤트)
+| 이벤트 | 토픽 | 수신 서비스 |
+|--------|------|-------------|
+| USER_CREATED | user.created | - |
+| USER_UPDATED | user.updated | - |
+| USER_DELETED | user.deleted | Account, Card, Transfer 등 |
 
 ---
 
 ## 📝 구현 체크리스트
 
-- [ ] Entity, Repository 생성
-- [ ] Service 레이어 구현
-- [ ] Controller 구현
-- [ ] DTO, Mapper 구현
-- [ ] Kafka Producer 구현
-- [ ] 예외 처리 (GlobalExceptionHandler)
-- [ ] 유효성 검증 (@Valid)
-- [ ] 비밀번호 암호화 (BCrypt)
-- [ ] 단위 테스트
-- [ ] 통합 테스트
-- [ ] API 문서화 (Swagger)
+### Domain Layer ✅
+- [x] UserErrorCode (에러 코드 정의)
+- [x] UserException (팩토리 메서드 패턴)
+- [x] UserStatus (정책 메서드 포함)
+- [x] UserId VO
+- [x] Email VO
+- [x] PhoneNumber VO
+- [x] User (Aggregate Root, 감사 필드 포함)
+
+### Application Layer
+- [ ] CreateUserUseCase
+- [ ] GetUserUseCase
+- [ ] UpdateUserUseCase
+- [ ] DeleteUserUseCase
+- [ ] UserPort (Repository 인터페이스)
+- [ ] AuthPort (Feign 인터페이스)
+- [ ] UserEventPort (Kafka 인터페이스)
+- [ ] DTO 정의
+
+### Infrastructure Layer
+- [ ] UserEntity (JPA Entity)
+- [ ] UserJpaRepository
+- [ ] UserRepositoryAdapter
+- [ ] AuthFeignClient
+- [ ] AuthFeignAdapter
+- [ ] UserKafkaProducer
+
+### Presentation Layer
+- [ ] UserController
+- [ ] Request/Response DTO
+- [ ] Swagger 문서화
+
+### 테스트
+- [ ] 도메인 단위 테스트
+- [ ] Application 단위 테스트
+- [ ] Repository 통합 테스트
+- [ ] API 통합 테스트
