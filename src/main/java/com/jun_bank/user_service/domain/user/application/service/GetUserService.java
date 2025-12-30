@@ -34,7 +34,7 @@ public class GetUserService implements GetUserUseCase {
   }
 
   @Override
-  public UserResult getMyProfile(String userId) {
+  public UserResult getUserByIdForOwner(String userId) {
     log.debug("내 프로필 조회 요청: userId={}", userId);
 
     User user = userRepository.findById(userId)
@@ -52,6 +52,17 @@ public class GetUserService implements GetUserUseCase {
         .orElseThrow(() -> UserException.userNotFound("email=" + email));
 
     return UserResult.from(user);
+  }
+
+  @Override
+  public UserResult getUserByEmailForOwner(String email) {
+    log.debug("이메일로 사용자 조회 요청 (본인용): email={}", email);
+
+    User user = userRepository.findByEmail(email)
+        .orElseThrow(() -> UserException.userNotFound("email=" + email));
+
+    // 본인 조회 시 전화번호 원본 제공
+    return UserResult.fromWithFullPhone(user);
   }
 
   @Override

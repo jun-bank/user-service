@@ -43,7 +43,7 @@ public interface GetUserUseCase {
    * @return 사용자 정보 (전화번호 원본)
    * @throws com.jun_bank.user_service.domain.user.domain.exception.UserException 사용자를 찾을 수 없는 경우
    */
-  UserResult getMyProfile(String userId);
+  UserResult getUserByIdForOwner(String userId);
 
   /**
    * 이메일로 사용자 조회
@@ -56,6 +56,19 @@ public interface GetUserUseCase {
    * @throws com.jun_bank.user_service.domain.user.domain.exception.UserException 사용자를 찾을 수 없는 경우
    */
   UserResult getUserByEmail(String email);
+
+  /**
+   * 이메일로 사용자 조회 (본인용)
+   * <p>
+   * Auth Server에서 로그인 시 사용합니다.
+   * 전화번호 원본을 포함하여 반환합니다.
+   * </p>
+   *
+   * @param email 이메일
+   * @return 사용자 정보 (전화번호 원본)
+   * @throws com.jun_bank.user_service.domain.user.domain.exception.UserException 사용자를 찾을 수 없는 경우
+   */
+  UserResult getUserByEmailForOwner(String email);
 
   /**
    * 이메일 존재 여부 확인
