@@ -37,8 +37,8 @@ import org.springframework.transaction.annotation.Transactional;
  *
  * <h3>이벤트 발행:</h3>
  * <p>
- * 이벤트 발행은 트랜잭션 커밋 후 비동기로 처리됩니다.
- * 발행 실패 시에도 회원가입은 완료됩니다.
+ * 이벤트 발행은 트랜잭션 커밋 후 처리됩니다.
+ * 발행 실패 시 EventRetryService를 통해 재시도됩니다.
  * </p>
  */
 @Slf4j
@@ -71,29 +71,52 @@ public class CreateUserService implements CreateUserUseCase {
     // 3. User 저장 (ID 생성)
     User savedUser = userRepository.save(user);
     String userId = savedUser.getUserId().value();
-
     log.info("사용자 저장 완료: userId={}", userId);
 
-    // 4. Auth Server에 인증 정보 생성 요청
-    try {
-      authServicePort.createAuthUser(userId, command.email(), command.password());
-      log.info("Auth Server 인증 정보 생성 완료: userId={}", userId);
-    } catch (Exception e) {
-      log.error("Auth Server 인증 정보 생성 실패: userId={}", userId, e);
-      throw e;  // 트랜잭션 롤백
-    }
+    // 4. Auth Server에 인증 정보 생성 요청 (실패 시 트랜잭션 롤백)
+    createAuthUser(userId, command.email(), command.password());
 
-    // 5. user.created 이벤트 발행 (비동기)
-    try {
-      userEventPublisher.publishUserCreated(savedUser);
-      log.info("user.created 이벤트 발행 완료: userId={}", userId);
-    } catch (Exception e) {
-      // 이벤트 발행 실패는 로그만 남기고 진행
-      log.warn("user.created 이벤트 발행 실패: userId={}", userId, e);
-    }
+    // 5. user.created 이벤트 발행 (실패 시 재시도 큐에 추가)
+    publishCreateEventSafely(savedUser);
 
     log.info("회원가입 완료: userId={}, email={}", userId, command.email());
 
     return UserResult.fromWithFullPhone(savedUser);
+  }
+
+  /**
+   * Auth Server 인증 정보 생성
+   * <p>
+   * 실패 시 예외를 던져 트랜잭션을 롤백합니다.
+   * 회원가입은 Auth 정보 없이 완료될 수 없기 때문입니다.
+   * </p>
+   */
+  private void createAuthUser(String userId, String email, String password) {
+    try {
+      authServicePort.createAuthUser(userId, email, password);
+      log.info("Auth Server 인증 정보 생성 완료: userId={}", userId);
+    } catch (Exception e) {
+      log.error("Auth Server 인증 정보 생성 실패: userId={}, error={}", userId, e.getMessage(), e);
+      throw e;  // 트랜잭션 롤백
+    }
+  }
+
+  /**
+   * 생성 이벤트 발행 (안전하게)
+   * <p>
+   * 실패 시 EventPublisher 내부에서 EventRetryService를 통해 재시도 큐에 추가.
+   * 회원가입 자체는 성공으로 처리됩니다.
+   * </p>
+   */
+  private void publishCreateEventSafely(User savedUser) {
+    try {
+      userEventPublisher.publishUserCreated(savedUser);
+      log.info("user.created 이벤트 발행 완료: userId={}", savedUser.getUserId().value());
+    } catch (Exception e) {
+      // 이벤트 발행 실패는 로그만 남김
+      // UserEventPublisher 구현체에서 EventRetryService에 추가하도록 처리
+      log.warn("user.created 이벤트 발행 실패: userId={}, error={}",
+          savedUser.getUserId().value(), e.getMessage());
+    }
   }
 }
